@@ -12,6 +12,37 @@
   <b>Figure 2. Overview of the proposed HALO framework. HALO performs online boundary generation, coarse-to-fine dynamic dilation, and architecture-aware supervision scheduling during training. All extra components are discarded in inference, introducing no overhead.</b>
 </p>
 
+# Introduction
+<p align="center">
+  <img src="figures/Figure1_Inference_Speed.png" width="500"/>
+  <br>
+  <b>Figure 1. Accuracy-efficiency trade-off on Cityscapes. HALO shifts lightweight real-time backbones to a better accuracy-efficiency region without changing the deployed inference cost. FPS values of prior methods are shown for reference only.</b>
+</p>
+
+<p align="center">
+  <img src="figures/Figure3_Online_Laplacian_Boundary.png" width="500"/>
+  <br>
+  <b>Figure 5. Validation mIoU curves during training on Cityscapes under the same single-GPU setting. HALO converges to consistently higher final mIoU than the reproduced baselines on both DDRNet-23-slim and PIDNet-S.</b>
+</p>
+
+<p align="center">
+  <img src="figures/Figure4-1_PIDNet_Halo.png" width="500"/>
+  <br>
+  <b>Figure 4. Architecture-aware scheduling in HALO. With milestones at T/3 and 2T/3, the boundary dilation is scheduled as 5→4→3, the Dice-loss weight is reduced as 3.0→1.5→1.0, and the feedback weight remains fixed at 1.0. This decoupled design enables coarse-to-fine boundary refinement with stable cross-branch feedback.</b>
+</p>
+
+<p align="center">
+  <img src="figures/Figure5-loss-miou.png" width="500"/>
+  <br>
+  <b>Figure 5. Validation mIoU curves during training on Cityscapes under the same single-GPU setting. HALO converges to consistently higher final mIoU than the reproduced baselines on both DDRNet-23-slim and PIDNet-S.</b>
+</p>
+
+<p align="center">
+  <img src="figures/Figure6_cityscapes_pidnet-halo.png" width="500"/>
+  <br>
+  <b>Figure 6. Qualitative comparison of segmentation results on the Cityscapes dataset. From left to right: input image, ground truth, baseline PIDNet-S prediction, and our HALO prediction. Red boxes highlight fine-grained boundary regions.</b>
+</p>
+
 ## Highlights
 
 - **Online Laplacian Boundary (OLB):** Generates class-wise boundary targets directly from semantic labels with no precomputation and no learnable parameters.
