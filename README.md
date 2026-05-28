@@ -4,9 +4,13 @@
 <a id="english"></a>
 # HALO: Architecture-Adapted Online Boundary Supervision for Real-Time Semantic Segmentation
 
-> **TL;DR:** A training-only boundary supervision framework that improves real-time semantic segmentation without adding any inference-time parameters or FLOPs.
+>  A training-only boundary supervision framework that improves real-time semantic segmentation without adding any inference-time parameters or FLOPs.
 
-
+<p align="center">
+  <img src="figures/Figure2_HALO_Overall_Framework.png" width="800"/>
+  <br>
+  <b>Figure 2. Overview of the proposed HALO framework. HALO performs online boundary generation, coarse-to-fine dynamic dilation, and architecture-aware supervision scheduling during training. All extra components are discarded in inference, introducing no overhead.</b>
+</p>
 
 ## Highlights
 
