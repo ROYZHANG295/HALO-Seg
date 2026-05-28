@@ -1,4 +1,4 @@
-```markdown
+
 [English](#english) | [简体中文](#简体中文)
 
 <a id="english"></a>
@@ -6,7 +6,7 @@
 
 > **TL;DR:** A training-only boundary supervision framework that improves real-time semantic segmentation without adding any inference-time parameters or FLOPs.
 
----
+
 
 ## Highlights
 
