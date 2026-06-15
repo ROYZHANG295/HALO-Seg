@@ -2,7 +2,7 @@
 [English](#english) | [简体中文](#简体中文)
 
 <a id="english"></a>
-# HALO: Architecture-Adapted Online Boundary Supervision for Real-Time Semantic Segmentation
+# Architecture-Adapted Online Boundary Supervision for Real-Time Semantic Segmentation
 
 >  A training-only boundary supervision framework that improves real-time semantic segmentation without adding any inference-time parameters or FLOPs.
 
@@ -49,6 +49,7 @@
 - **Dynamic Dilation:** Progressively reshapes boundary targets from coarse to fine following a curriculum learning schedule (5 → 4 → 3).
 - **Architecture-Adapted Scheduling (AAS):** Decouples boundary supervision from cross-branch semantic feedback and adapts supervision strength to each backbone.
 - **Zero inference overhead:** All HALO modules are disabled at inference. FPS, parameters, and FLOPs remain identical to the baseline.
+- **Code mapping (current repo):** Main HALO training configs are in `configs/haloseg/`; core implementations are in `mmseg/models/decode_heads/ddr_head_halo_avg3_opt_fb_fix05.py` and `mmseg/models/decode_heads/pid_head_halo_ddr_avg3_opt.py`.
 
 ---
 
@@ -144,28 +145,32 @@ data/
 
 ```bash
 bash tools/dist_train.sh \
-    configs/halo/halo_pidnet-s_cityscapes.py \
-    1 \
-    --seed 304
+  configs/haloseg/pidnet-s_1xb12-120k_1024x1024-cityscapes-halo.py \
+  1
 ```
 
 ### Cityscapes — DDRNet-23-slim + HALO
 
 ```bash
 bash tools/dist_train.sh \
-    configs/halo/halo_ddrnet23slim_cityscapes.py \
-    1 \
-    --seed 304
+  configs/haloseg/ddrnet_23-slim_in1k-pre_1xb12-120k_cityscapes-1024x1024_halo.py \
+  1
 ```
 
-### CamVid fine-tuning
+### CamVid fine-tuning — PIDNet-S + HALO
 
 ```bash
 bash tools/dist_train.sh \
-    configs/halo/halo_pidnet-s_camvid_finetune.py \
-    1 \
-    --seed 304 \
-    --load-from checkpoints/halo_pidnet-s_cityscapes.pth
+  configs/haloseg/pidnet-s_camvid_halo.py \
+  1
+```
+
+### CamVid fine-tuning — DDRNet-23-slim + HALO
+
+```bash
+bash tools/dist_train.sh \
+  configs/haloseg/ddrnet-23-slim_camvid_halo.py \
+  1
 ```
 
 All main experiments are conducted on a single RTX 3090 with batch size 12. Training PIDNet-S takes approximately 16 hours and 13.5 GB of GPU memory.
@@ -177,15 +182,12 @@ All main experiments are conducted on a single RTX 3090 with batch size 12. Trai
 ```bash
 # Evaluate on Cityscapes val set
 bash tools/dist_test.sh \
-    configs/halo/halo_pidnet-s_cityscapes.py \
+  configs/haloseg/pidnet-s_1xb12-120k_1024x1024-cityscapes-halo.py \
     checkpoints/halo_pidnet-s_cityscapes.pth \
     1
 
-# Evaluate Boundary IoU (dilation ratio 0.02)
-python tools/analysis_tools/evaluate_boundary_iou.py \
-    configs/halo/halo_pidnet-s_cityscapes.py \
-    checkpoints/halo_pidnet-s_cityscapes.pth \
-    --dilation-ratio 0.02
+# Evaluate per-class Boundary IoU (Baseline vs HALO)
+python configs/haloseg/boundary_iou_per_class.py
 ```
 
 ---
@@ -195,23 +197,29 @@ python tools/analysis_tools/evaluate_boundary_iou.py \
 ```text
 HALO-Seg/
 ├── configs/
-│   └── halo/
-│       ├── halo_pidnet-s_cityscapes.py
-│       ├── halo_ddrnet23slim_cityscapes.py
-│       └── halo_pidnet-s_camvid_finetune.py
+│   └── haloseg/
+│       ├── pidnet-s_1xb12-120k_1024x1024-cityscapes-halo.py
+│       ├── ddrnet_23-slim_in1k-pre_1xb12-120k_cityscapes-1024x1024_halo.py
+│       ├── pidnet-s_camvid_halo.py
+│       ├── ddrnet-23-slim_camvid_halo.py
+│       └── boundary_iou_per_class.py
 ├── mmseg/
 │   ├── models/
-│   │   ├── losses/
-│   │   │   └── dice_loss.py
 │   │   └── decode_heads/
-│   │       └── halo_head.py
-│   └── utils/
-│       └── olb.py
+│   │       ├── ddr_head_halo_avg3_opt_fb_fix05.py
+│   │       └── pid_head_halo_ddr_avg3_opt.py
 ├── tools/
 ├── data/
 ├── checkpoints/
 └── README.md
 ```
+
+## Core Implementation Files
+
+- `configs/haloseg/*`: all HALO experiment configs (Cityscapes + CamVid, base + HALO).
+- `mmseg/models/decode_heads/ddr_head_halo_avg3_opt_fb_fix05.py`: DDRNet HALO head (`DDRHeadHALOAvg3OptFbFix05`).
+- `mmseg/models/decode_heads/pid_head_halo_ddr_avg3_opt.py`: PIDNet HALO head (`PIDHeadHALOSameDDRAvg3Opt`).
+- `configs/haloseg/boundary_iou_per_class.py`: Boundary IoU comparison utility.
 
 ---
 
@@ -275,7 +283,7 @@ This project is released under the [Apache 2.0 License](LICENSE).
 <a id="简体中文"></a>
 # 简体中文
 
-# HALO: 面向实时语义分割的架构自适应在线边界监督框架
+# 面向实时语义分割的架构自适应在线边界监督框架
 
 > **摘要:** 一种纯训练阶段的边界监督框架，在不增加任何推理期参数或计算量（FLOPs）的情况下提升实时语义分割的性能。
 
@@ -382,28 +390,32 @@ data/
 
 ```bash
 bash tools/dist_train.sh \
-    configs/halo/halo_pidnet-s_cityscapes.py \
-    1 \
-    --seed 304
+  configs/haloseg/pidnet-s_1xb12-120k_1024x1024-cityscapes-halo.py \
+  1
 ```
 
 ### Cityscapes — DDRNet-23-slim + HALO
 
 ```bash
 bash tools/dist_train.sh \
-    configs/halo/halo_ddrnet23slim_cityscapes.py \
-    1 \
-    --seed 304
+  configs/haloseg/ddrnet_23-slim_in1k-pre_1xb12-120k_cityscapes-1024x1024_halo.py \
+  1
 ```
 
-### CamVid 微调
+### CamVid 微调 — PIDNet-S + HALO
 
 ```bash
 bash tools/dist_train.sh \
-    configs/halo/halo_pidnet-s_camvid_finetune.py \
-    1 \
-    --seed 304 \
-    --load-from checkpoints/halo_pidnet-s_cityscapes.pth
+  configs/haloseg/pidnet-s_camvid_halo.py \
+  1
+```
+
+### CamVid 微调 — DDRNet-23-slim + HALO
+
+```bash
+bash tools/dist_train.sh \
+  configs/haloseg/ddrnet-23-slim_camvid_halo.py \
+  1
 ```
 
 所有主实验均在单张 RTX 3090（Batch size 12）上进行。PIDNet-S 的训练时间约为 16 小时，显存占用约 13.5 GB。
@@ -415,15 +427,12 @@ bash tools/dist_train.sh \
 ```bash
 # 在 Cityscapes 验证集上评估
 bash tools/dist_test.sh \
-    configs/halo/halo_pidnet-s_cityscapes.py \
+  configs/haloseg/pidnet-s_1xb12-120k_1024x1024-cityscapes-halo.py \
     checkpoints/halo_pidnet-s_cityscapes.pth \
     1
 
-# 评估 Boundary IoU (膨胀率 0.02)
-python tools/analysis_tools/evaluate_boundary_iou.py \
-    configs/halo/halo_pidnet-s_cityscapes.py \
-    checkpoints/halo_pidnet-s_cityscapes.pth \
-    --dilation-ratio 0.02
+# 评估 Boundary IoU（Baseline vs HALO 逐类别对比）
+python configs/haloseg/boundary_iou_per_class.py
 ```
 
 ---
@@ -433,23 +442,29 @@ python tools/analysis_tools/evaluate_boundary_iou.py \
 ```text
 HALO-Seg/
 ├── configs/
-│   └── halo/
-│       ├── halo_pidnet-s_cityscapes.py
-│       ├── halo_ddrnet23slim_cityscapes.py
-│       └── halo_pidnet-s_camvid_finetune.py
+│   └── haloseg/
+│       ├── pidnet-s_1xb12-120k_1024x1024-cityscapes-halo.py
+│       ├── ddrnet_23-slim_in1k-pre_1xb12-120k_cityscapes-1024x1024_halo.py
+│       ├── pidnet-s_camvid_halo.py
+│       ├── ddrnet-23-slim_camvid_halo.py
+│       └── boundary_iou_per_class.py
 ├── mmseg/
 │   ├── models/
-│   │   ├── losses/
-│   │   │   └── dice_loss.py
 │   │   └── decode_heads/
-│   │       └── halo_head.py
-│   └── utils/
-│       └── olb.py
+│   │       ├── ddr_head_halo_avg3_opt_fb_fix05.py
+│   │       └── pid_head_halo_ddr_avg3_opt.py
 ├── tools/
 ├── data/
 ├── checkpoints/
 └── README.md
 ```
+
+## 代码结构对应说明
+
+- `configs/haloseg/*`：HALO 相关训练配置（Cityscapes + CamVid，base + halo）。
+- `mmseg/models/decode_heads/ddr_head_halo_avg3_opt_fb_fix05.py`：DDRNet 的 HALO 解码头实现（`DDRHeadHALOAvg3OptFbFix05`）。
+- `mmseg/models/decode_heads/pid_head_halo_ddr_avg3_opt.py`：PIDNet 的 HALO 解码头实现（`PIDHeadHALOSameDDRAvg3Opt`）。
+- `configs/haloseg/boundary_iou_per_class.py`：Boundary IoU 对比评估脚本。
 
 ---
 
