@@ -18,32 +18,19 @@ from mmengine.logging import MMLogger
 @MODELS.register_module()
 class DDRHeadHALOAvg3OptFbFix05(BaseDecodeHead):
     """
-    ===========================================================================
-    🏆 HALO: Holistic Asymmetric Laplacian Oracle (全局非对称拉普拉斯先知)
-    ===========================================================================
-    【论文核心故事线 (The Grand Story) - 跨分支反哺解耦版】：
-    
-    1. 痛点 (The Trap of Two-Branch Networks)：
-       DDRNet 这种实时网络在推理时【仅保留 Context 主干分支】，完全丢弃 Spatial 分支。
-       如果将边界 Loss 仅加在 Spatial 分支上，会导致“训练时花里胡哨，推理时原形毕露”，
-       测试 mIoU 与 Baseline 完美重合。
-       
-    2. 创新 1 (Cross-Branch Oracle Feedback 跨分支先知反哺)：
-       打破分支壁垒！我们让高分辨率的 Spatial 分支充当“边界先知(Oracle)”，
-       预测出高频边界。然后，利用该预测结果掩蔽(Mask)真值标签，生成极其严苛的
-       【纯边界语义标签】，并将其直接作为强监督信号【砸向 Context 分支】！
-       迫使主干网络在低分辨率下也能学到极其锐利的物理边界。推理时 0 FLOPs 增加！
-       
-    3. 创新 2 (Decoupled Dynamic Weighting 解耦动态权重调度)：
-       【核心】：将边界自监督权重 (dice_w) 与跨分支反哺权重 (fb_w) 物理层面解耦！
-       虽然在 DDRNet 中两者数值同步衰减，但这一架构完美支持了 PIDNet 等大容量网络
-       对边界分支施加极高初始权重(如 3.0)，同时使用稳压器(fb_w=1.0)保护主干网络的策略。
-       
-       本代码（DDRNet配置）采用 1.0 -> 0.5 -> 0.1 的均分三阶段衰减：
-       - 阶段 1 (0~33.3%): 强先验期 (dice_w=1.0, fb_w=1.0)。
-       - 阶段 2 (33.3%~66.7%): 平滑衰减期 (dice_w=0.5, fb_w=0.5)，防止冲垮主干。
-       - 阶段 3 (66.7%~100%): 极速冲刺期 (dice_w=0.1, fb_w=0.1)，彻底抚平震荡。
-    ===========================================================================
+     HALO 版 DDRHead（解耦反馈权重）。
+
+     设计目标：
+     1. 基于语义标签在线生成拉普拉斯边界监督。
+     2. 利用 Spatial 分支预测的边界掩码，构造边界语义标签，
+         对 Context 分支进行跨分支语义反馈监督。
+     3. 将边界内部监督权重（dice_w）与反馈权重（fb_w）解耦，
+         便于做稳定性与性能的独立消融。
+
+     当前默认调度（本文件主版本）：
+     - dilation: 5 -> 4 -> 3
+     - dice_w: 1.0 -> 0.5 -> 0.1
+     - fb_w: 固定为 0.5
     """
 
     def __init__(self,
@@ -52,7 +39,7 @@ class DDRHeadHALOAvg3OptFbFix05(BaseDecodeHead):
                  num_classes: int,
                  norm_cfg: OptConfigType = dict(type='BN'),
                  act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
-                 max_iters: int = 120000,  # <--- 【新增】传入总训练步数，触发均分引擎
+                 max_iters: int = 120000,  # 总训练步数，用于构建三阶段调度
                  **kwargs):
         super().__init__(
             in_channels,
@@ -66,20 +53,16 @@ class DDRHeadHALOAvg3OptFbFix05(BaseDecodeHead):
         self.aux_head = self._make_base_head(self.in_channels // 2, self.channels)
         self.aux_cls_seg = nn.Conv2d(self.channels, self.out_channels, kernel_size=1)
         
-        # 记录总步数，用于计算均分点
+        # 记录总步数，用于计算调度里程碑
         self.max_iters = max_iters
         
-        # =====================================================================
-        # 【修改点 1】：新增计步器与轻量化边界预测头
-        # =====================================================================
+        # 训练步计数器 + 轻量化边界预测头
         self.register_buffer('local_step', torch.tensor(0, dtype=torch.long))
         self.bd_cls_seg = nn.Conv2d(self.channels, 1, kernel_size=1)
 
-        # =====================================================================
-        # 【HALO 核心引擎】：初始化时自动计算三阶段均分解耦调度表
-        # =====================================================================
+        # 初始化解耦调度表
         self.dynamic_schedule = self._build_avg3_schedule(self.max_iters)
-        # 获取当前的全局 logger
+        # 当前全局日志器
         self.logger = MMLogger.get_current_instance()
 
     def init_weights(self):
@@ -103,7 +86,7 @@ class DDRHeadHALOAvg3OptFbFix05(BaseDecodeHead):
 
     def forward(self, inputs: Union[Tensor, Tuple[Tensor]]) -> Union[Tensor, Tuple[Tensor]]:
         if self.training:
-            # DDRNet 典型的双分支输入: c3 (空间细节), c5 (全局上下文)
+            # DDRNet 训练期双分支输入：c3（空间细节）与 c5（全局上下文）
             c3_feat, c5_feat = inputs
             
             x_c = self.head(c5_feat)
@@ -112,22 +95,17 @@ class DDRHeadHALOAvg3OptFbFix05(BaseDecodeHead):
             x_s = self.aux_head(c3_feat)
             x_s_logit = self.aux_cls_seg(x_s)
             
-            # =================================================================
-            # 【修改点 2】：训练期提取边界 logits
-            # =================================================================
+            # 训练期额外输出边界 logits
             bd_logit = self.bd_cls_seg(x_s)
 
             return x_c_logit, x_s_logit, bd_logit
         else:
-            # 推理阶段：完全丢弃边界计算，0 FLOPs 增加！
-            # 注意：这里返回的 x_c 就是 Context 分支，所以必须在训练时反哺给它！
+            # 推理期仅保留 Context 分支，不引入额外边界计算
             x_c = self.head(inputs)
             x_c = self.cls_seg(x_c)
             return x_c
 
-    # =========================================================================
-    # 【修改点 3】：在线拉普拉斯边界提取 (On-the-fly Laplacian Boundary Extraction)
-    # =========================================================================
+    # 在线拉普拉斯边界提取
     def _generate_laplacian_boundary(self, semantic_gt: Tensor, num_classes: int, 
                                      ignore_index: int = 255, dilation_size: int = 3) -> Tensor:
         valid_mask = (semantic_gt != ignore_index).float().unsqueeze(1)
@@ -151,185 +129,90 @@ class DDRHeadHALOAvg3OptFbFix05(BaseDecodeHead):
             
         return (boundary_map * valid_mask).squeeze(1)
 
-    # =========================================================================
-    # 【修改点 4】：自适应均分三阶段课程学习调度器 (解耦版)
-    # =========================================================================
+    # 三阶段解耦调度器
     def _build_avg3_schedule(self, max_iters: int) -> dict:
-        """根据总训练步数，自动计算三阶段平均分割点，完美解耦内部监督与外部反哺！"""
-        t1 = int(max_iters / 3.0)      # 三等分点 1 (33.3%)
-        t2 = int(max_iters * 2.0 / 3.0)  # 三等分点 2 (66.7%)
-        
-        # 成功 77.95
+        """根据总步数自动生成三阶段调度里程碑。"""
+        t1 = int(max_iters / 3.0)      # 三等分点 1（约 33.3%）
+        t2 = int(max_iters * 2.0 / 3.0)  # 三等分点 2（约 66.7%）
+
+        # 主版本：fb_w 固定为 0.5
+        # 记录结果：78.23
         schedule = {
-            # 阶段1：强先验期
-            # dice_w 控制内部边界学习，fb_w 控制外部反哺力度
+            # 阶段 1
             0:      {'dilation': 5, 'dice_w': 1.0, 'fb_w': 0.5},
             t1:     {'dilation': 5, 'dice_w': 1.0, 'fb_w': 0.5},
             
-            # 阶段2：平滑衰减期
+            # 阶段 2
             t1 + 1: {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.5},
             t2:     {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.5},
             
-            # 阶段3：极速冲刺期 (语义解放)
+            # 阶段 3
             t2 + 1: {'dilation': 3, 'dice_w': 0.1, 'fb_w': 0.5},
             max_iters: {'dilation': 3, 'dice_w': 0.1, 'fb_w': 0.5}
         }
 
-        # fb_w=1.0 恒定1.0，追求大一统 
-        # 失败：77.66
-        # 版本二，xx_fb_w_1
+        # 消融 1：fb_w 固定为 1.0
+        # 记录结果：77.64
         # schedule = {
-        #     # 阶段1：强先验期
-        #     # dice_w 控制内部边界学习，fb_w 控制外部反哺力度
+        #     # 阶段 1
         #     0:      {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
         #     t1:     {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
             
-        #     # 阶段2：平滑衰减期
+        #     # 阶段 2
         #     t1 + 1: {'dilation': 4, 'dice_w': 0.5, 'fb_w': 1.0},
         #     t2:     {'dilation': 4, 'dice_w': 0.5, 'fb_w': 1.0},
             
-        #     # 阶段3：极速冲刺期 (语义解放)
+        #     # 阶段 3
         #     t2 + 1: {'dilation': 3, 'dice_w': 0.1, 'fb_w': 1.0},
         #     max_iters: {'dilation': 3, 'dice_w': 0.1, 'fb_w': 1.0}
         # }
 
-        # 版本三，发现版本二最后40k不如版本1，推测仍然是dice_w的问题，所以讲dice_w提高到0.3
-        # 失败：77.23
+        # 消融 2：fb_w 固定为 0.3
+        # 记录结果：77.81
         # schedule = {
-        #     # 阶段1：强先验期
-        #     # dice_w 控制内部边界学习，fb_w 控制外部反哺力度
-        #     0:      {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
-        #     t1:     {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
+        #     # 阶段 1
+        #     0:      {'dilation': 5, 'dice_w': 1.0, 'fb_w': 0.3},
+        #     t1:     {'dilation': 5, 'dice_w': 1.0, 'fb_w': 0.3},
             
-        #     # 阶段2：平滑衰减期
-        #     t1 + 1: {'dilation': 4, 'dice_w': 0.5, 'fb_w': 1.0},
-        #     t2:     {'dilation': 4, 'dice_w': 0.5, 'fb_w': 1.0},
+        #     # 阶段 2
+        #     t1 + 1: {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.3},
+        #     t2:     {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.3},
             
-        #     # 重点在这里！阶段3不再降到0.1，而是保持 0.5 的反哺，内部稍微降一点到 0.3
-        #     t2 + 1: {'dilation': 3, 'dice_w': 0.3, 'fb_w': 0.5},
-        #     max_iters: {'dilation': 3, 'dice_w': 0.3, 'fb_w': 0.5}
-        # }
-
-        # 版本四，发现版本二最后40k不如版本1，推测仍然是dice_w的问题，所以讲dice_w提高到0.3， fb_w仍然=1.0
-        # 失败：77.38
-        # schedule = {
-        #     # 阶段1：强先验期
-        #     # dice_w 控制内部边界学习，fb_w 控制外部反哺力度
-        #     0:      {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
-        #     t1:     {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
-            
-        #     # 阶段2：平滑衰减期
-        #     t1 + 1: {'dilation': 4, 'dice_w': 0.5, 'fb_w': 1.0},
-        #     t2:     {'dilation': 4, 'dice_w': 0.5, 'fb_w': 1.0},
-            
-        #     # 重点在这里！阶段3不再降到0.1，而是保持 0.5 的反哺，内部稍微降一点到 0.3
-        #     t2 + 1: {'dilation': 3, 'dice_w': 0.3, 'fb_w': 1.0},
-        #     max_iters: {'dilation': 3, 'dice_w': 0.3, 'fb_w': 1.0}
-        # }
-
-        # 版本五 在版本1基础上小改
-        # 77.84
-        # ddrnet_workdir/halo-ddrnet_23-slim_in1k-pre-halo_avg3-opt_1xb12-120k_cityscapes-1024x1024-dilation-4
-        # schedule = {
-        #     # 阶段1：强先验期
-        #     # dice_w 控制内部边界学习，fb_w 控制外部反哺力度
-        #     0:      {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
-        #     t1:     {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
-            
-        #     # 阶段2：平滑衰减期
-        #     t1 + 1: {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.5},
-        #     t2:     {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.5},
-            
-        #     # 阶段3：极速冲刺期 (语义解放) - 不要降到 3！让 DDRNet 停留在 Dilation=4。略粗一点的边界对轻量级网络更友好，梯度更平滑。
-        #     t2 + 1: {'dilation': 4, 'dice_w': 0.1, 'fb_w': 0.1},
-        #     max_iters: {'dilation': 4, 'dice_w': 0.1, 'fb_w': 0.1}
-        # }
-
-        # 版本六 在版本1基础上修改fb_w=0.3
-        # 77.67
-        # schedule = {
-        #     # 阶段1：强先验期
-        #     # dice_w 控制内部边界学习，fb_w 控制外部反哺力度
-        #     0:      {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
-        #     t1:     {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
-            
-        #     # 阶段2：平滑衰减期
-        #     t1 + 1: {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.5},
-        #     t2:     {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.5},
-            
-        #     # 阶段3：极速冲刺期 (语义解放)
+        #     # 阶段 3
         #     t2 + 1: {'dilation': 3, 'dice_w': 0.1, 'fb_w': 0.3},
         #     max_iters: {'dilation': 3, 'dice_w': 0.1, 'fb_w': 0.3}
         # }
 
-        # 版本7，看80k左右的趋势，仍然压着baseline走，所以直接用40k-80k的参数
-        # 77.63
+        # 消融 3：fb_w 固定为 0.1
+        # 记录结果：77.48
         # schedule = {
-        #     # 阶段1：强先验期
-        #     # dice_w 控制内部边界学习，fb_w 控制外部反哺力度
-        #     0:      {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
-        #     t1:     {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
+        #     # 阶段 1
+        #     0:      {'dilation': 5, 'dice_w': 1.0, 'fb_w': 0.1},
+        #     t1:     {'dilation': 5, 'dice_w': 1.0, 'fb_w': 0.1},
             
-        #     # 阶段2：平滑衰减期
-        #     t1 + 1: {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.5},
-        #     t2:     {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.5},
+        #     # 阶段 2
+        #     t1 + 1: {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.1},
+        #     t2:     {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.1},
             
-        #     # 阶段3：极速冲刺期 (语义解放)
-        #     # t2 + 1: {'dilation': 3, 'dice_w': 0.1, 'fb_w': 0.3},
-        #     # max_iters: {'dilation': 3, 'dice_w': 0.1, 'fb_w': 0.3}
-        #     t2 + 1: {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.5},
-        #     max_iters: {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.5}
-        # }
-
-        # 版本8 在版本1基础上修改fb_w=0.3 dice_w=0.3
-        # 77.65
-        # schedule = {
-        #     # 阶段1：强先验期
-        #     # dice_w 控制内部边界学习，fb_w 控制外部反哺力度
-        #     0:      {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
-        #     t1:     {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
-            
-        #     # 阶段2：平滑衰减期
-        #     t1 + 1: {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.5},
-        #     t2:     {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.5},
-            
-        #     # 阶段3：极速冲刺期 (语义解放)
-        #     t2 + 1: {'dilation': 3, 'dice_w': 0.3, 'fb_w': 0.3},
-        #     max_iters: {'dilation': 3, 'dice_w': 0.3, 'fb_w': 0.3}
-        # }
-
-        # 版本9: 提取 Spatial 分支 (先知) 预测的边界掩码 bd_pred_mask = (pred_sigmoid > 0.8)
-        # 版本9 bd_pred_mask = (pred_sigmoid > 0.8) 之前是0.5
-        # ddr_head_halo_avg3_opt_mask08.py
-        # 77.53
-        # schedule = {
-        #     # 阶段1：强先验期
-        #     # dice_w 控制内部边界学习，fb_w 控制外部反哺力度
-        #     0:      {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
-        #     t1:     {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
-            
-        #     # 阶段2：平滑衰减期
-        #     t1 + 1: {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.5},
-        #     t2:     {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.5},
-            
-        #     # 阶段3：极速冲刺期 (语义解放)
+        #     # 阶段 3
         #     t2 + 1: {'dilation': 3, 'dice_w': 0.1, 'fb_w': 0.1},
         #     max_iters: {'dilation': 3, 'dice_w': 0.1, 'fb_w': 0.1}
         # }
 
-        # 版本10 开始动手stage2 
-        # 提前解放版：压缩 Stage 1 和 Stage 2 的时间
-        # t1 = 30000  # 原来可能是 40000
-        # t2 = 60000  # 原来可能是 80000
-        # # 77.51
+        # 消融 4：fb_w 固定为 0.0（关闭反馈监督）
+        # 记录结果：77.56
         # schedule = {
-        #     0:         {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
-        #     t1:        {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},
-        #     t1 + 1:    {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.5},
-        #     t2:        {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.5},
-        #     # 从 60k 到 120k，整整一半的时间都在进行 Semantic Liberation！
-        #     t2 + 1:    {'dilation': 3, 'dice_w': 0.1, 'fb_w': 0.1},
-        #     max_iters: {'dilation': 3, 'dice_w': 0.1, 'fb_w': 0.1}
+        #     # 阶段 1
+        #     0:      {'dilation': 5, 'dice_w': 1.0, 'fb_w': 0.0},
+        #     t1:     {'dilation': 5, 'dice_w': 1.0, 'fb_w': 0.0},
+            
+        #     # 阶段 2
+        #     t1 + 1: {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.0},
+        #     t2:     {'dilation': 4, 'dice_w': 0.5, 'fb_w': 0.0},
+            
+        #     # 阶段 3
+        #     t2 + 1: {'dilation': 3, 'dice_w': 0.1, 'fb_w': 0.0},
+        #     max_iters: {'dilation': 3, 'dice_w': 0.1, 'fb_w': 0.0}
         # }
 
         print(schedule)
@@ -337,7 +220,7 @@ class DDRHeadHALOAvg3OptFbFix05(BaseDecodeHead):
         return schedule
 
     def _get_dynamic_params(self, current_step: int) -> Tuple[int, float, float]:
-        """读取动态参数，执行平滑衰减，返回完全解耦的参数"""
+        """读取当前步对应的动态参数，并在阶段内做线性插值。"""
         schedule = self.dynamic_schedule
         milestones = sorted(schedule.keys())
         
@@ -358,7 +241,7 @@ class DDRHeadHALOAvg3OptFbFix05(BaseDecodeHead):
         progress = (current_step - start_step) / float(end_step - start_step)
         
         cur_dilation = start_cfg['dilation']
-        # 独立执行线性插值，彻底解耦
+        # 对 dice_w 与 fb_w 分别线性插值
         cur_dice_w = start_cfg['dice_w'] + progress * (end_cfg['dice_w'] - start_cfg['dice_w'])
         cur_fb_w = start_cfg['fb_w'] + progress * (end_cfg['fb_w'] - start_cfg['fb_w'])
         
@@ -366,15 +249,13 @@ class DDRHeadHALOAvg3OptFbFix05(BaseDecodeHead):
 
     def loss_by_feat(self, seg_logits: Tuple[Tensor], batch_data_samples: SampleList) -> dict:
         
-        # =====================================================================
-        # 【修改点 5】：最终损失函数计算逻辑 (跨分支反哺解耦版)
-        # =====================================================================
+        # 最终损失：全局语义损失 + 边界内部监督 + 跨分支反馈监督
         
         if self.training:
             self.local_step += 1
         current_step = self.local_step.item()
         
-        # 获取解耦后的动态参数：cur_fb_w 现已独立！
+        # 获取当前步的解耦参数
         cur_dilation, cur_dice_w, cur_fb_w = self._get_dynamic_params(current_step)
 
 
@@ -391,16 +272,16 @@ class DDRHeadHALOAvg3OptFbFix05(BaseDecodeHead):
         
         seg_label = seg_label.squeeze(1)
 
-        # 实时生成拉普拉斯边界标签 (基于动态 Dilation)
+        # 基于当前 dilation 在线生成拉普拉斯边界标签
         bd_label = self._generate_laplacian_boundary(
             seg_label, num_classes=self.num_classes, ignore_index=self.ignore_index, dilation_size=cur_dilation
         )
 
-        # 1. 计算原版 DDRNet 的全局语义损失 (让它们看全图，绝不遮挡！)
+        # 1) 全局语义损失（Context / Spatial）
         loss['loss_context'] = self.loss_decode[0](context_logit, seg_label)
         loss['loss_spatial'] = self.loss_decode[1](spatial_logit, seg_label)
         
-        # 2. 边界分支内部 Loss (使用 cur_dice_w)
+        # 2) 边界分支内部损失（BCE + Dice）
         bce_loss = F.binary_cross_entropy_with_logits(bd_logit.squeeze(1), bd_label)
         
         pred_sigmoid = torch.sigmoid(bd_logit[:, 0, :, :])
@@ -409,24 +290,21 @@ class DDRHeadHALOAvg3OptFbFix05(BaseDecodeHead):
         union = (pred_sigmoid * valid_mask).sum(dim=(1, 2)) + (bd_label * valid_mask).sum(dim=(1, 2))
         dice_loss = (1.0 - (2.0 * intersection + 1e-5) / (union + 1e-5)).mean()
         
-        # 核心：内部监督使用独立加权
+        # 使用动态 dice_w 加权边界内部监督
         loss['loss_bd_laplacian'] = bce_loss + cur_dice_w * dice_loss
         
-        # =====================================================================
-        # 🚀 绝杀机制：跨分支先知反哺 (Cross-Branch Oracle Feedback) 🚀
-        # =====================================================================
-        # 提取 Spatial 分支 (先知) 预测的边界掩码
+        # 3) 跨分支反馈：由 Spatial 边界预测构造边界语义监督
+        # 提取 Spatial 分支预测的边界掩码
         bd_pred_mask = (pred_sigmoid > 0.5)
         
-        # 制作“纯边界语义标签”：只保留先知认为是边界的地方，其他地方全部填 255 (忽略)
+        # 构造边界语义标签：非边界位置填 ignore_index
         filler = torch.ones_like(seg_label) * self.ignore_index
         halo_label = torch.where(bd_pred_mask, seg_label, filler)
         
-        # 【致胜一击】：将严苛的边界标签砸向 Context 分支！
-        # 使用独立的 cur_fb_w 控制反哺力度，彻底解耦！
+        # 对 Context 分支施加反馈损失，并用 fb_w 独立加权
         loss['loss_halo_feedback'] = self.loss_decode[0](context_logit, halo_label) * cur_fb_w
         
-        # 3. 算个准确率汇报一下 (基于主干 Context 分支的预测)
+        # 4) 记录 Context 分支分割准确率
         loss['acc_seg'] = accuracy(context_logit, seg_label, ignore_index=self.ignore_index)
 
         return loss

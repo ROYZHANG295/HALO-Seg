@@ -50,27 +50,19 @@ class BasePIDHead(BaseModule):
 @MODELS.register_module()
 class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
     """
-    ===========================================================================
-    🏆 HALO: Topology-Aware Boundary Supervision (通用解耦框架版 - PIDNet)
-    ===========================================================================
-    【Universal Framework 跨架构大一统】
-    
-    为了证明 HALO 框架的绝对普适性，PIDNet 采用了与 DDRNet 完全一致的【权重解耦架构】，
-    但根据 PIDNet D分支容量极大的物理特性，配置了专属的“架构感知(Architecture-Aware)”参数：
-    
-    1. 内部监督 (dice_w): 采用 3.0 -> 1.0 -> 0.5 的激进衰减。
-       前期下猛药(3.0)瞬间唤醒庞大的 D 分支，迫使其画出极其锐利的物理边界；
-       后期平滑降权，防止过拟合。
-       
-    2. 外部反哺 (fb_w): 采用 1.0 -> 1.0 -> 1.0 的恒定稳压器。
-       无论 D 分支内部的 loss 权重有多高，砸向 I 分支(主干)的反馈权重始终锁定在 1.0。
-       这完美解决了前期 3.0 权重带来的“毒反馈(Toxic Feedback)”和“语义坍塌”问题！
-       
-    3. 三阶段硬跳变调度 (Universal Piecewise-Constant Scheduler):
-       - 阶段 1 (0~33.3%): Dilation=5, dice_w=3.0, fb_w=1.0
-       - 阶段 2 (33.3%~66.7%): Dilation=4, dice_w=1.0, fb_w=1.0
-       - 阶段 3 (66.7%~100%): Dilation=3, dice_w=0.5, fb_w=1.0
-    ===========================================================================
+     PIDNet 版本 HALO 解码头（解耦权重框架）。
+
+     设计要点：
+     1. 在线构造拉普拉斯边界监督。
+     2. 使用 D 分支边界预测掩码，构造边界语义标签，
+         对 I 分支执行跨分支语义反馈监督。
+     3. 将边界内部监督权重（dice_w）与反馈权重（fb_w）解耦，
+         便于单独控制训练稳定性与边界学习强度。
+
+     当前默认调度：
+     - dilation: 5 -> 4 -> 3
+     - dice_w: 3.0 -> 1.5 -> 1.0
+     - fb_w: 1.0（固定）
     """
     
     def __init__(self,
@@ -100,9 +92,9 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
         self.p_cls_seg = nn.Conv2d(channels, self.out_channels, kernel_size=1)
         self.d_cls_seg = nn.Conv2d(in_channels // 4, 1, kernel_size=1)
 
-        # 【统一化】：采用解耦后的三阶段均分调度表
+        # 初始化三阶段解耦调度表
         self.dynamic_schedule = self._build_avg3_schedule(self.max_iters)
-        # 获取当前的全局 logger
+        # 当前全局日志器
         self.logger = MMLogger.get_current_instance()
 
     def init_weights(self):
@@ -129,9 +121,43 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
         ]
         return torch.stack(gt_semantic_segs, dim=0)
 
-    # =========================================================================
-    # 1. 在线拉普拉斯边界提取
-    # =========================================================================
+    def _generate_binary_boundary(self,
+                               semantic_gt: Tensor,
+                               ignore_index: int = 255,
+                               dilation_size: int = 3) -> Tensor:
+        """
+        简单二值边界：检测相邻像素标签跳变，不区分类别。
+        对应消融项：Binary Target。
+        """
+        valid_mask = (semantic_gt != ignore_index).float()
+        
+        # 水平方向标签跳变
+        h_diff = (semantic_gt[:, :, 1:] != semantic_gt[:, :, :-1]).float()
+        # 垂直方向标签跳变
+        v_diff = (semantic_gt[:, 1:, :] != semantic_gt[:, :-1, :]).float()
+        
+        # 对齐尺寸
+        boundary_map = torch.zeros_like(semantic_gt).float()
+        boundary_map[:, :, :-1] += h_diff
+        boundary_map[:, :, 1:]  += h_diff
+        boundary_map[:, :-1, :] += v_diff
+        boundary_map[:, 1:, :]  += v_diff
+        boundary_map = (boundary_map > 0).float()
+        
+        # 膨胀（保持和 OLB 一致）
+        if dilation_size > 1:
+            pad = dilation_size // 2
+            boundary_map = F.max_pool2d(
+                boundary_map.unsqueeze(1),
+                kernel_size=dilation_size,
+                stride=1,
+                padding=pad
+            ).squeeze(1)
+        
+        boundary_map = boundary_map * valid_mask
+        return boundary_map
+
+    # 在线拉普拉斯边界提取
     def _generate_laplacian_boundary(self, 
                                      semantic_gt: Tensor, 
                                      num_classes: int, 
@@ -173,49 +199,26 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
         boundary_map = boundary_map * valid_mask
         return boundary_map.squeeze(1)
 
-    # =========================================================================
-    # 2. 大一统的分阶段硬跳变解耦调度器 (Decoupled Piecewise-Constant Scheduler)
-    # =========================================================================
+    # 三阶段硬跳变解耦调度器
     def _build_avg3_schedule(self, max_iters: int) -> dict:
         t1 = int(max_iters / 3.0)
         t2 = int(max_iters * 2.0 / 3.0)
 
-        # 版本1【解耦化】：dice_w 采用 3.0->1.0->0.5，fb_w 恒定 1.0 保护主干
-        # schedule = {
-        #     0:         {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
-        #     t1:        {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
-        #     t1 + 1:    {'dilation': 4, 'dice_w': 1.0, 'fb_w': 0.5},
-        #     t2:        {'dilation': 4, 'dice_w': 1.0, 'fb_w': 0.5},
-        #     t2 + 1:    {'dilation': 3, 'dice_w': 0.5, 'fb_w': 0.1},
-        #     max_iters: {'dilation': 3, 'dice_w': 0.5, 'fb_w': 0.1}
-        # }
-
-        # 版本2 跑出了 78.61,但是后劲不足
-        # schedule = {
-        #     0:         {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
-        #     t1:        {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
-        #     t1 + 1:    {'dilation': 4, 'dice_w': 1.0, 'fb_w': 1.0},
-        #     t2:        {'dilation': 4, 'dice_w': 1.0, 'fb_w': 1.0},
-        #     t2 + 1:    {'dilation': 3, 'dice_w': 0.5, 'fb_w': 1.0},
-        #     max_iters: {'dilation': 3, 'dice_w': 0.5, 'fb_w': 1.0}
-        # }
-
-        # 版本3 虽然上一个版本跑出 78.61，但是明显后劲不足
-        # 策略：减缓 Dice Loss 的衰减，全程保持较高的边界约束
-        # pidnet_workdir/halo-pidnet-s-halo-same-ddr-1xb12-120k_1024x1024-cityscapes-FULL-fb_w-1_dice_w15-10
-        # pidnet_workdir/halo-pidnet-s-halo-same-ddr-1xb12-120k_1024x1024-cityscapes-FULL-fb_w-1_dice_w15-10-best-run2
-        # 成功跑出 79.08的高分
+        # 主版本：三阶段硬跳变，解耦 D 分支内部监督与跨分支反馈权重
+        # 记录结果：79.08 
+        # 策略：放缓 Dice 权重衰减，保持较强边界约束
         schedule = {
             0:         {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
             t1:        {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
-            t1 + 1:    {'dilation': 4, 'dice_w': 1.5, 'fb_w': 1.0},  # 从 1.0 提高到 1.5
+            t1 + 1:    {'dilation': 4, 'dice_w': 1.5, 'fb_w': 1.0},  
             t2:        {'dilation': 4, 'dice_w': 1.5, 'fb_w': 1.0},
-            t2 + 1:    {'dilation': 3, 'dice_w': 1.0, 'fb_w': 1.0},  # 尾段保底 1.0，而不是 0.5
+            t2 + 1:    {'dilation': 3, 'dice_w': 1.0, 'fb_w': 1.0},  
             max_iters: {'dilation': 3, 'dice_w': 1.0, 'fb_w': 1.0}
         }
 
-        # 版本4 消融实验，动态膨胀5-4-3，dice_w固定3.0，fb_w固定1.0，证明 动态膨胀有效果
-        # pidnet_workdir/halo-pidnet-s-halo-same-ddr-1xb12-120k_1024x1024-cityscapes-FULL-dilation543-dice3-fb1-v4
+        # 消融 1
+        # OLB Only	Class-wise	✓	Fixed 5	Fixed 3.0	78.6
+        # 78.58
         # schedule = {
         #     0:         {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
         #     t1:        {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
@@ -223,6 +226,55 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
         #     t2:        {'dilation': 4, 'dice_w': 3.0, 'fb_w': 1.0},
         #     t2 + 1:    {'dilation': 3, 'dice_w': 3.0, 'fb_w': 1.0},  
         #     max_iters: {'dilation': 3, 'dice_w': 3.0, 'fb_w': 1.0}
+        # }
+
+        # 消融 2
+        # OLB+DD	Class-wise	✓	5-4-3	Fixed 3.0	78.8
+        # 78.84
+        # schedule = {
+        #     0:         {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
+        #     t1:        {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
+        #     t1 + 1:    {'dilation': 4, 'dice_w': 3.0, 'fb_w': 1.0}, 
+        #     t2:        {'dilation': 4, 'dice_w': 3.0, 'fb_w': 1.0},
+        #     t2 + 1:    {'dilation': 3, 'dice_w': 3.0, 'fb_w': 1.0},  
+        #     max_iters: {'dilation': 3, 'dice_w': 3.0, 'fb_w': 1.0}
+        # }
+
+        # 消融 3
+        # OLB+AAS	Class-wise	✓	Fixed 5	3.0-1.5-1.0	78.7
+        # 78.72
+        # schedule = {
+        #     0:         {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
+        #     t1:        {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
+        #     t1 + 1:    {'dilation': 5, 'dice_w': 1.5, 'fb_w': 1.0}, 
+        #     t2:        {'dilation': 5, 'dice_w': 1.5, 'fb_w': 1.0},
+        #     t2 + 1:    {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0},  
+        #     max_iters: {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0}
+        # }
+
+        # 消融 4
+        # Binary Target	Binary	✓	5-4-3	3.0-1.5-1.0	78.7
+        # 注意：需要启用 _generate_binary_boundary
+        # 78.67
+        # schedule = {
+        #     0:         {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
+        #     t1:        {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
+        #     t1 + 1:    {'dilation': 4, 'dice_w': 1.5, 'fb_w': 1.0},  
+        #     t2:        {'dilation': 4, 'dice_w': 1.5, 'fb_w': 1.0},
+        #     t2 + 1:    {'dilation': 3, 'dice_w': 1.0, 'fb_w': 1.0},  
+        #     max_iters: {'dilation': 3, 'dice_w': 1.0, 'fb_w': 1.0}
+        # }
+
+        # 消融 5
+        # w/o Semantic Re-sup.	Class-wise	-	5-4-3	3.0-1.5-1.0	78.4
+        # 78.35
+        # schedule = {
+        #     0:         {'dilation': 5, 'dice_w': 3.0, 'fb_w': 0.0},
+        #     t1:        {'dilation': 5, 'dice_w': 3.0, 'fb_w': 0.0},
+        #     t1 + 1:    {'dilation': 4, 'dice_w': 1.5, 'fb_w': 0.0},  
+        #     t2:        {'dilation': 4, 'dice_w': 1.5, 'fb_w': 0.0},
+        #     t2 + 1:    {'dilation': 3, 'dice_w': 1.0, 'fb_w': 0.0},  
+        #     max_iters: {'dilation': 3, 'dice_w': 1.0, 'fb_w': 0.0}
         # }
         return schedule
 
@@ -237,7 +289,7 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
                 break
                 
         cfg = schedule[start_step]
-        # 返回完全解耦的三个参数
+        # 返回解耦后的三项参数
         return cfg['dilation'], cfg['dice_w'], cfg['fb_w']
 
     def loss_by_feat(self, seg_logits: Tuple[Tensor], batch_data_samples: SampleList) -> dict:
@@ -246,7 +298,7 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
             self.local_step += 1
         current_step = self.local_step.item()
         
-        # 接收解耦后的三个参数
+        # 获取当前步的解耦参数
         cur_dilation, cur_dice_w, cur_fb_w = self._get_dynamic_params(current_step)
 
         if current_step % 50 == 0:
@@ -266,11 +318,18 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
             sem_label, num_classes=self.num_classes, ignore_index=self.ignore_index, dilation_size=cur_dilation
         )
 
-        # 1. 基础全局语义损失 (P 分支与 I 分支)
+        # 消融 4：改用二值边界标签时启用
+        # bd_label = self._generate_binary_boundary(
+        #     sem_label,
+        #     ignore_index=self.ignore_index,
+        #     dilation_size=cur_dilation
+        # )
+
+        # 1) 全局语义损失（P 分支与 I 分支）
         loss['loss_sem_p'] = self.loss_decode[0](p_logit, sem_label, ignore_index=self.ignore_index)
         loss['loss_sem_i'] = self.loss_decode[1](i_logit, sem_label)
         
-        # 2. 联合边界损失 (D 分支内部监督)
+        # 2) 边界内部监督（D 分支）
         bce_loss = self.loss_decode[2](d_logit, bd_label)
         pred_sigmoid = torch.sigmoid(d_logit[:, 0, :, :])
         
@@ -279,24 +338,21 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
         union = (pred_sigmoid * valid_mask).sum(dim=(1, 2)) + (bd_label * valid_mask).sum(dim=(1, 2))
         dice_loss = (1.0 - (2.0 * intersection + 1e-5) / (union + 1e-5)).mean()
         
-        # 内部监督使用激进的 cur_dice_w
+        # 使用动态 dice_w 加权边界内部监督
         loss['loss_bd_laplacian'] = bce_loss + cur_dice_w * dice_loss
         
-        # =====================================================================
-        # 🚀 绝杀机制：跨分支先知反哺 (Cross-Branch Oracle Feedback) 🚀
-        # =====================================================================
-        # 提取 D 分支 (先知) 预测的边界掩码 (统一固定阈值 0.5)
+        # 3) 跨分支语义反馈（固定阈值 0.5）
+        # 提取 D 分支预测边界掩码
         bd_pred_mask = (pred_sigmoid > 0.5)
         
-        # 制作“纯边界语义标签”：只保留先知认为是边界的地方，其他地方填 255
+        # 构造边界语义标签：非边界位置填 ignore_index
         filler = torch.ones_like(sem_label) * self.ignore_index
         halo_label = torch.where(bd_pred_mask, sem_label, filler)
         
-        # 将严苛的边界标签砸向 I 分支！
-        # 【核心修改】：乘以独立的稳压器 cur_fb_w，完美保护主干网络！
+        # 对 I 分支施加反馈监督，并用 fb_w 独立加权
         loss['loss_halo_feedback'] = self.loss_decode[3](i_logit, halo_label) * cur_fb_w
         
-        # 4. 准确率统计
+        # 4) 分割准确率统计
         loss['acc_seg'] = accuracy(i_logit, sem_label, ignore_index=self.ignore_index)
             
         return loss
