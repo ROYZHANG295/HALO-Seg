@@ -50,19 +50,40 @@ class BasePIDHead(BaseModule):
 @MODELS.register_module()
 class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
     """
-     PIDNet 版本 HALO 解码头（解耦权重框架）。
+    HALO decode head for PIDNet with decoupled boundary supervision.
 
-     设计要点：
-     1. 在线构造拉普拉斯边界监督。
-     2. 使用 D 分支边界预测掩码，构造边界语义标签，
-         对 I 分支执行跨分支语义反馈监督。
-     3. 将边界内部监督权重（dice_w）与反馈权重（fb_w）解耦，
-         便于单独控制训练稳定性与边界学习强度。
+    Overview
+    --------
+    This head extends the standard PIDNet three-branch structure (P / I / D)
+    with two HALO components:
 
-     当前默认调度：
-     - dilation: 5 -> 4 -> 3
-     - dice_w: 3.0 -> 1.5 -> 1.0
-     - fb_w: 1.0（固定）
+    1. Online Laplacian Boundary Targets
+       Boundary masks are generated on-the-fly from the semantic GT using a
+       Laplacian kernel followed by optional max-pool dilation.  This avoids
+       storing pre-computed edge maps and keeps the target resolution aligned
+       with the current training stage.
+
+    2. Cross-Branch Semantic Re-supervision
+       The D branch acts as a boundary oracle.  Its sigmoid predictions are
+       thresholded at 0.5 to build a binary boundary mask, which is then used
+       to select a sparse set of boundary pixels from the semantic GT.  The
+       resulting boundary-only label is fed back to supervise the I branch,
+       forcing the main backbone to encode sharp boundary semantics.
+
+    3. Decoupled Weight Scheduling
+       The boundary-internal supervision weight (dice_w) and the cross-branch
+       feedback weight (fb_w) are controlled by independent schedules.  This
+       allows the D branch to use an aggressive dice_w (e.g. 3.0) in the early
+       training phase without destabilising the I branch, because fb_w can be
+       kept at a stable fixed value.
+
+    Default schedule (active in this file)
+    ---------------------------------------
+    Stage 1  (0 ~ 33.3%)  :  dilation=5, dice_w=3.0, fb_w=1.0
+    Stage 2  (33.3 ~ 66.7%):  dilation=4, dice_w=1.5, fb_w=1.0
+    Stage 3  (66.7 ~ 100%) :  dilation=3, dice_w=1.0, fb_w=1.0
+
+    Reported result: 79.08 mIoU on Cityscapes val.
     """
     
     def __init__(self,
@@ -92,9 +113,9 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
         self.p_cls_seg = nn.Conv2d(channels, self.out_channels, kernel_size=1)
         self.d_cls_seg = nn.Conv2d(in_channels // 4, 1, kernel_size=1)
 
-        # 初始化三阶段解耦调度表
+        # Build the three-stage piecewise-constant decoupled schedule.
         self.dynamic_schedule = self._build_avg3_schedule(self.max_iters)
-        # 当前全局日志器
+        # Retrieve the global MMEngine logger for training-step logging.
         self.logger = MMLogger.get_current_instance()
 
     def init_weights(self):
@@ -126,25 +147,37 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
                                ignore_index: int = 255,
                                dilation_size: int = 3) -> Tensor:
         """
-        简单二值边界：检测相邻像素标签跳变，不区分类别。
-        对应消融项：Binary Target。
+        Generate a class-agnostic binary boundary map by detecting label
+        discontinuities between adjacent pixels (no per-class distinction).
+
+        This method corresponds to the ablation variant 'Binary Target'.
+        Swap in this function instead of _generate_laplacian_boundary when
+        running ablation 4.
+
+        Args:
+            semantic_gt:  Semantic segmentation GT, shape (B, H, W).
+            ignore_index: Pixels with this label are excluded from the output.
+            dilation_size: Kernel size for max-pool boundary dilation.
+
+        Returns:
+            Binary boundary map of shape (B, H, W) with values in {0, 1}.
         """
         valid_mask = (semantic_gt != ignore_index).float()
-        
-        # 水平方向标签跳变
+
+        # Detect horizontal label transitions.
         h_diff = (semantic_gt[:, :, 1:] != semantic_gt[:, :, :-1]).float()
-        # 垂直方向标签跳变
+        # Detect vertical label transitions.
         v_diff = (semantic_gt[:, 1:, :] != semantic_gt[:, :-1, :]).float()
-        
-        # 对齐尺寸
+
+        # Accumulate transition signals and mark any triggered pixel as boundary.
         boundary_map = torch.zeros_like(semantic_gt).float()
         boundary_map[:, :, :-1] += h_diff
         boundary_map[:, :, 1:]  += h_diff
         boundary_map[:, :-1, :] += v_diff
         boundary_map[:, 1:, :]  += v_diff
         boundary_map = (boundary_map > 0).float()
-        
-        # 膨胀（保持和 OLB 一致）
+
+        # Dilate to widen boundary regions (consistent with OLB dilation).
         if dilation_size > 1:
             pad = dilation_size // 2
             boundary_map = F.max_pool2d(
@@ -157,12 +190,36 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
         boundary_map = boundary_map * valid_mask
         return boundary_map
 
-    # 在线拉普拉斯边界提取
-    def _generate_laplacian_boundary(self, 
-                                     semantic_gt: Tensor, 
-                                     num_classes: int, 
-                                     ignore_index: int = 255, 
+    # -------------------------------------------------------------------------
+    # Online Laplacian Boundary Extraction
+    # -------------------------------------------------------------------------
+    def _generate_laplacian_boundary(self,
+                                     semantic_gt: Tensor,
+                                     num_classes: int,
+                                     ignore_index: int = 255,
                                      dilation_size: int = 3) -> Tensor:
+        """
+        Compute per-class boundary masks from semantic GT using a Laplacian
+        filter, then take the per-pixel union across all classes.
+
+        Steps:
+          1. One-hot encode the GT (ignore_index pixels mapped to class 0
+             temporarily, then masked out via valid_mask).
+          2. Apply a depth-wise Laplacian convolution per class to detect
+             regions with non-zero gradient magnitude.
+          3. Threshold at 0.1 to obtain binary per-class edge maps.
+          4. Collapse class dimension with max-pooling to get a single map.
+          5. Optionally dilate with max-pool to widen thin boundary lines.
+
+        Args:
+            semantic_gt:  Semantic segmentation GT, shape (B, H, W).
+            num_classes:  Total number of semantic classes.
+            ignore_index: Pixels with this label are masked to 0 in output.
+            dilation_size: Kernel size for boundary dilation (1 = no dilation).
+
+        Returns:
+            Float boundary map of shape (B, H, W) with values in [0, 1].
+        """
         
         valid_mask = (semantic_gt != ignore_index).float().unsqueeze(1)
         clean_gt = torch.where(
@@ -199,14 +256,33 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
         boundary_map = boundary_map * valid_mask
         return boundary_map.squeeze(1)
 
-    # 三阶段硬跳变解耦调度器
+    # -------------------------------------------------------------------------
+    # Three-Stage Piecewise-Constant Decoupled Scheduler
+    # -------------------------------------------------------------------------
     def _build_avg3_schedule(self, max_iters: int) -> dict:
-        t1 = int(max_iters / 3.0)
-        t2 = int(max_iters * 2.0 / 3.0)
+        """
+        Build a piecewise-constant schedule that partitions training into three
+        equal stages and assigns independent (dilation, dice_w, fb_w) values
+        to each stage.
 
-        # 主版本：三阶段硬跳变，解耦 D 分支内部监督与跨分支反馈权重
-        # 记录结果：79.08 
-        # 策略：放缓 Dice 权重衰减，保持较强边界约束
+        Milestone layout (milestones mark the START of each segment pair):
+
+            [0, t1]        Stage 1 – large dilation, high dice weight
+            [t1+1, t2]     Stage 2 – medium dilation, moderate dice weight
+            [t2+1, max]    Stage 3 – small dilation, low dice weight
+
+        dice_w  controls the Dice loss weight for D-branch internal supervision.
+        fb_w    controls the feedback loss weight applied to the I branch.
+        """
+        t1 = int(max_iters / 3.0)         # end of stage 1 (~33.3%)
+        t2 = int(max_iters * 2.0 / 3.0)  # end of stage 2 (~66.7%)
+
+        # ------------------------------------------------------------------ #
+        # Default (active) schedule                                           #
+        # Strategy: gradual dice_w decay (3.0 -> 1.5 -> 1.0) with dilation   #
+        # shrinkage to progressively tighten boundary supervision.            #
+        # Reported result: 79.08 mIoU on Cityscapes val.                      #
+        # ------------------------------------------------------------------ #
         schedule = {
             0:         {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
             t1:        {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
@@ -216,9 +292,10 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
             max_iters: {'dilation': 3, 'dice_w': 1.0, 'fb_w': 1.0}
         }
 
-        # 消融 1
-        # OLB Only	Class-wise	✓	Fixed 5	Fixed 3.0	78.6
-        # 78.58
+        # ------------------------------------------------------------------ #
+        # Ablation 1: OLB Only – fixed dilation=5, fixed dice_w=3.0          #
+        # OLB Only  Class-wise  ✓  Fixed 5  Fixed 3.0  →  78.58 mIoU         #
+        # ------------------------------------------------------------------ #
         # schedule = {
         #     0:         {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
         #     t1:        {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
@@ -228,9 +305,11 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
         #     max_iters: {'dilation': 3, 'dice_w': 3.0, 'fb_w': 1.0}
         # }
 
-        # 消融 2
-        # OLB+DD	Class-wise	✓	5-4-3	Fixed 3.0	78.8
-        # 78.84
+        # ------------------------------------------------------------------ #
+        # Ablation 2: OLB + Dynamic Dilation – dilation 5->4->3,             #
+        #             fixed dice_w=3.0                                        #
+        # OLB+DD  Class-wise  ✓  5-4-3  Fixed 3.0  →  78.84 mIoU            #
+        # ------------------------------------------------------------------ #
         # schedule = {
         #     0:         {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
         #     t1:        {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
@@ -240,9 +319,11 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
         #     max_iters: {'dilation': 3, 'dice_w': 3.0, 'fb_w': 1.0}
         # }
 
-        # 消融 3
-        # OLB+AAS	Class-wise	✓	Fixed 5	3.0-1.5-1.0	78.7
-        # 78.72
+        # ------------------------------------------------------------------ #
+        # Ablation 3: OLB + Adaptive weight Schedule – fixed dilation=5,     #
+        #             dice_w decays 3.0 -> 1.5 -> 1.0                        #
+        # OLB+AAS  Class-wise  ✓  Fixed 5  3.0-1.5-1.0  →  78.72 mIoU      #
+        # ------------------------------------------------------------------ #
         # schedule = {
         #     0:         {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
         #     t1:        {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
@@ -252,10 +333,12 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
         #     max_iters: {'dilation': 5, 'dice_w': 1.0, 'fb_w': 1.0}
         # }
 
-        # 消融 4
-        # Binary Target	Binary	✓	5-4-3	3.0-1.5-1.0	78.7
-        # 注意：需要启用 _generate_binary_boundary
-        # 78.67
+        # ------------------------------------------------------------------ #
+        # Ablation 4: Binary boundary target instead of class-wise OLB.      #
+        # NOTE: also switch _generate_laplacian_boundary -> _generate_binary  #
+        #       _boundary in loss_by_feat.                                    #
+        # Binary Target  Binary  ✓  5-4-3  3.0-1.5-1.0  →  78.67 mIoU      #
+        # ------------------------------------------------------------------ #
         # schedule = {
         #     0:         {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
         #     t1:        {'dilation': 5, 'dice_w': 3.0, 'fb_w': 1.0},
@@ -265,9 +348,10 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
         #     max_iters: {'dilation': 3, 'dice_w': 1.0, 'fb_w': 1.0}
         # }
 
-        # 消融 5
-        # w/o Semantic Re-sup.	Class-wise	-	5-4-3	3.0-1.5-1.0	78.4
-        # 78.35
+        # ------------------------------------------------------------------ #
+        # Ablation 5: Disable cross-branch semantic re-supervision (fb_w=0). #
+        # w/o Re-sup.  Class-wise  –  5-4-3  3.0-1.5-1.0  →  78.35 mIoU    #
+        # ------------------------------------------------------------------ #
         # schedule = {
         #     0:         {'dilation': 5, 'dice_w': 3.0, 'fb_w': 0.0},
         #     t1:        {'dilation': 5, 'dice_w': 3.0, 'fb_w': 0.0},
@@ -279,17 +363,25 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
         return schedule
 
     def _get_dynamic_params(self, current_step: int) -> Tuple[int, float, float]:
+        """
+        Look up the active schedule entry for the given training step and
+        return the three decoupled parameters.
+
+        Returns:
+            Tuple of (dilation_size, dice_w, fb_w) for the current stage.
+        """
         schedule = self.dynamic_schedule
         milestones = sorted(schedule.keys())
-        
+
+        # Find the milestone that the current step falls into.
         start_step = milestones[0]
         for i in range(len(milestones) - 1):
             if milestones[i] <= current_step <= milestones[i+1]:
                 start_step = milestones[i]
                 break
-                
+
         cfg = schedule[start_step]
-        # 返回解耦后的三项参数
+        # Return the three decoupled parameters for this stage.
         return cfg['dilation'], cfg['dice_w'], cfg['fb_w']
 
     def loss_by_feat(self, seg_logits: Tuple[Tensor], batch_data_samples: SampleList) -> dict:
@@ -298,11 +390,15 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
             self.local_step += 1
         current_step = self.local_step.item()
         
-        # 获取当前步的解耦参数
+        # Fetch decoupled schedule parameters for the current step.
         cur_dilation, cur_dice_w, cur_fb_w = self._get_dynamic_params(current_step)
 
+        # Periodic status log every 50 steps.
         if current_step % 50 == 0:
-            self.logger.info('cur_dilation=' + str(cur_dilation) + ',cur_dice_w=' + str(cur_dice_w) + ', cur_fb_w=' + str(cur_fb_w))
+            self.logger.info(
+                f'[HALO] step={current_step}/{self.max_iters} | '
+                f'dilation={cur_dilation}, dice_w={cur_dice_w:.3f}, fb_w={cur_fb_w:.3f}'
+            )
 
         loss = dict()
         p_logit, i_logit, d_logit = seg_logits
@@ -318,41 +414,55 @@ class PIDHeadHALOSameDDRAvg3Opt(BaseDecodeHead):
             sem_label, num_classes=self.num_classes, ignore_index=self.ignore_index, dilation_size=cur_dilation
         )
 
-        # 消融 4：改用二值边界标签时启用
+        # Ablation 4: uncomment below to swap in class-agnostic binary boundary.
         # bd_label = self._generate_binary_boundary(
         #     sem_label,
         #     ignore_index=self.ignore_index,
         #     dilation_size=cur_dilation
         # )
 
-        # 1) 全局语义损失（P 分支与 I 分支）
+        # ------------------------------------------------------------------
+        # 1) Global semantic losses for the P branch and the I branch.
+        # ------------------------------------------------------------------
         loss['loss_sem_p'] = self.loss_decode[0](p_logit, sem_label, ignore_index=self.ignore_index)
         loss['loss_sem_i'] = self.loss_decode[1](i_logit, sem_label)
-        
-        # 2) 边界内部监督（D 分支）
+
+        # ------------------------------------------------------------------
+        # 2) D-branch internal boundary supervision  (BCE + weighted Dice).
+        #    dice_w is decoupled from fb_w and decays across training stages.
+        # ------------------------------------------------------------------
         bce_loss = self.loss_decode[2](d_logit, bd_label)
         pred_sigmoid = torch.sigmoid(d_logit[:, 0, :, :])
-        
+
         valid_mask = (sem_label != self.ignore_index).float()
         intersection = (pred_sigmoid * bd_label * valid_mask).sum(dim=(1, 2))
         union = (pred_sigmoid * valid_mask).sum(dim=(1, 2)) + (bd_label * valid_mask).sum(dim=(1, 2))
         dice_loss = (1.0 - (2.0 * intersection + 1e-5) / (union + 1e-5)).mean()
-        
-        # 使用动态 dice_w 加权边界内部监督
+
+        # Combine BCE and Dice with the dynamic dice_w weight.
         loss['loss_bd_laplacian'] = bce_loss + cur_dice_w * dice_loss
-        
-        # 3) 跨分支语义反馈（固定阈值 0.5）
-        # 提取 D 分支预测边界掩码
+
+        # ------------------------------------------------------------------
+        # 3) Cross-branch semantic re-supervision  (feedback to I branch).
+        #    The D branch's sigmoid predictions are thresholded at 0.5 to
+        #    select boundary pixels, which are then used to construct a
+        #    sparse boundary-semantic label for supervising the I branch.
+        # ------------------------------------------------------------------
+
+        # Binarise D-branch predictions to obtain the boundary pixel mask.
         bd_pred_mask = (pred_sigmoid > 0.5)
-        
-        # 构造边界语义标签：非边界位置填 ignore_index
+
+        # Build the boundary-semantic label: keep GT only at boundary pixels;
+        # all other positions are masked out with ignore_index.
         filler = torch.ones_like(sem_label) * self.ignore_index
         halo_label = torch.where(bd_pred_mask, sem_label, filler)
-        
-        # 对 I 分支施加反馈监督，并用 fb_w 独立加权
+
+        # Apply the feedback loss to the I branch, scaled by independent fb_w.
         loss['loss_halo_feedback'] = self.loss_decode[3](i_logit, halo_label) * cur_fb_w
-        
-        # 4) 分割准确率统计
+
+        # ------------------------------------------------------------------
+        # 4) Segmentation accuracy metric (based on I-branch predictions).
+        # ------------------------------------------------------------------
         loss['acc_seg'] = accuracy(i_logit, sem_label, ignore_index=self.ignore_index)
             
         return loss
